@@ -12,10 +12,15 @@ The settings window, live status and motion visualization, tray controls, autost
 
 ## Linux
 
-A source build requires Rust plus the HID and desktop integration development packages. On Debian/Ubuntu:
+The Linux binary is portable: it links only against the C runtime every distribution
+already has (`libc`, `libm`, `libgcc_s`), and loads X11, Wayland and OpenGL at runtime, so
+there is nothing to install. Download it, `chmod +x`, run it. Release builds target glibc
+2.35, which covers Debian 12, Ubuntu 22.04 and newer, SteamOS 3.x, and current Arch and
+Fedora.
+
+A source build needs only a Rust toolchain -- no development packages:
 
 ```sh
-sudo apt-get install libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev
 cargo build --release
 ```
 

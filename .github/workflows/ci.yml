@@ -51,3 +51,22 @@ jobs:
       - name: Check Linux binary portability
         if: runner.os == 'Linux'
         run: .github/scripts/check-linux-portability.sh target/release/sc2dsu any
+
+      # Publishes each PR's binaries as downloadable artifacts, so a change can be tested
+      # on real hardware without a tag or a local toolchain for the other platform.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/sc2dsu.exe "dist/sc2dsu-windows-x86_64.exe"
+          else
+            cp target/release/sc2dsu "dist/sc2dsu-linux-x86_64"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sc2dsu-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error

@@ -1,4 +1,7 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// GUI mode should never flash a second CMD window on Windows, including from
+// a debug build. `--headless` and `--probe` explicitly attach or create one
+// below so their diagnostics remain visible.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod autostart;
 mod config;
@@ -348,6 +351,15 @@ fn run_device_thread(
                 controller.device.recalibrate();
             }
         }
+        let requested_slot = stats::RECALIBRATE_SLOT_REQUEST.swap(0, Ordering::Relaxed);
+        if requested_slot != 0 {
+            let slot = requested_slot - 1;
+            for controller in &mut controllers {
+                if controller.dsu_slot == Some(slot) {
+                    controller.device.recalibrate();
+                }
+            }
+        }
 
         poll_controllers(&mut controllers, &tx, &owned);
         thread::sleep(Duration::from_millis(2));
@@ -366,6 +378,64 @@ struct ManagedController {
     stale_samples: u32,
 }
 
+/// Resolve manual preferences first, then give every unpinned controller the
+/// first remaining DSU slot.  This preserves discovery-order behaviour until a
+/// user explicitly pins a controller in the dashboard.
+fn desired_slot_assignments(
+    controllers: &[ManagedController],
+    cfg: &config::Config,
+) -> Vec<Option<u8>> {
+    let mut desired = vec![None; controllers.len()];
+    let mut occupied = [false; triton::MAX_CONTROLLERS];
+
+    for (index, controller) in controllers.iter().enumerate() {
+        let Some(slot) = cfg.slot_for_controller(controller.device.controller.id) else {
+            continue;
+        };
+        let slot_index = usize::from(slot);
+        if !occupied[slot_index] {
+            desired[index] = Some(slot);
+            occupied[slot_index] = true;
+        }
+    }
+
+    for assignment in &mut desired {
+        if assignment.is_none()
+            && let Some(slot) = occupied.iter().position(|used| !used)
+        {
+            *assignment = Some(slot as u8);
+            occupied[slot] = true;
+        }
+    }
+    desired
+}
+
+fn sync_slot_assignments(
+    controllers: &mut [ManagedController],
+    tx: &SyncSender<triton::DeviceEvent>,
+) {
+    let desired = desired_slot_assignments(controllers, &config::snapshot());
+    for (controller, desired_slot) in controllers.iter_mut().zip(desired) {
+        if controller.dsu_slot == desired_slot {
+            continue;
+        }
+        if let Some(old_slot) = controller.dsu_slot {
+            let _ = tx.send(triton::DeviceEvent::Disconnected { slot: old_slot });
+        }
+        controller.dsu_slot = desired_slot;
+        if let Some(slot) = desired_slot {
+            eprintln!(
+                "controller: routed PID {:04X} iface {} to DSU slot {}",
+                controller.device.product_id, controller.device.interface_number, slot
+            );
+            let _ = tx.send(triton::DeviceEvent::Connected {
+                slot,
+                controller: controller.device.controller,
+            });
+        }
+    }
+}
+
 fn poll_controllers(
     controllers: &mut Vec<ManagedController>,
     tx: &SyncSender<triton::DeviceEvent>,
@@ -374,12 +444,7 @@ fn poll_controllers(
     const SILENCE_REOPEN_MS: u128 = 2000;
     const STALE_THRESHOLD: u32 = 100;
 
-    let mut occupied = [false; triton::MAX_CONTROLLERS];
-    for controller in controllers.iter() {
-        if let Some(slot) = controller.dsu_slot {
-            occupied[usize::from(slot)] = true;
-        }
-    }
+    sync_slot_assignments(controllers, tx);
 
     let mut index = 0;
     while index < controllers.len() {
@@ -402,33 +467,11 @@ fn poll_controllers(
                     controllers[index].last_imu_timestamp = Some(sample.imu.timestamp_us);
                     controllers[index].stale_samples = 0;
                 }
-                if fresh_sample {
-                    let dsu_slot = match controllers[index].dsu_slot {
-                        Some(slot) => Some(slot),
-                        None => {
-                            let available = occupied
-                                .iter()
-                                .position(|used| !used)
-                                .map(|slot| slot as u8);
-                            if let Some(slot) = available {
-                                occupied[usize::from(slot)] = true;
-                                controllers[index].dsu_slot = Some(slot);
-                                eprintln!(
-                                    "controller: assigned PID {:04X} iface {} to DSU slot {}",
-                                    controllers[index].device.product_id,
-                                    controllers[index].device.interface_number,
-                                    slot
-                                );
-                            }
-                            available
-                        }
-                    };
-                    if let Some(slot) = dsu_slot {
-                        let _ = tx.try_send(triton::DeviceEvent::Sample {
-                            slot,
-                            state: sample,
-                        });
-                    }
+                if fresh_sample && let Some(slot) = controllers[index].dsu_slot {
+                    let _ = tx.try_send(triton::DeviceEvent::Sample {
+                        slot,
+                        state: sample,
+                    });
                 }
             }
             Ok(None) => {
@@ -451,7 +494,6 @@ fn poll_controllers(
             // Hand the path back so the scanner can reopen this interface.
             release_path(owned, &controller.path);
             if let Some(slot) = controller.dsu_slot {
-                occupied[usize::from(slot)] = false;
                 let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
                 eprintln!("controller: DSU slot {slot} disconnected");
             }

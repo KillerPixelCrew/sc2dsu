@@ -1,13 +1,26 @@
 use crate::{autostart, config, stats};
-use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
+use eframe::egui::{self, Color32, Stroke};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tray::{Tray, TrayEvent};
 
 const AXIS_LABELS: [&str; 3] = ["raw X", "raw Y", "raw Z"];
-/// Solid-blue tray icon, 16x16.
-const TRAY_ICON_RGBA: [u8; 4] = [60, 130, 220, 255];
+/// Solid-amber tray icon, 16x16.
+const TRAY_ICON_RGBA: [u8; 4] = [211, 123, 48, 255];
 const TRAY_ICON_SIZE: u32 = 16;
+
+const BG: Color32 = Color32::from_rgb(20, 20, 18);
+const SURFACE: Color32 = Color32::from_rgb(31, 31, 28);
+const SURFACE_DEEP: Color32 = Color32::from_rgb(24, 24, 22);
+const BORDER: Color32 = Color32::from_rgb(75, 70, 61);
+const BORDER_STRONG: Color32 = Color32::from_rgb(208, 120, 47);
+const TEXT: Color32 = Color32::from_rgb(241, 234, 218);
+const MUTED: Color32 = Color32::from_rgb(187, 176, 155);
+const DIM: Color32 = Color32::from_rgb(142, 133, 118);
+const AMBER: Color32 = Color32::from_rgb(244, 177, 82);
+const AMBER_BRIGHT: Color32 = Color32::from_rgb(255, 198, 104);
+const ORANGE: Color32 = Color32::from_rgb(216, 116, 43);
+const SUCCESS: Color32 = Color32::from_rgb(104, 190, 124);
 
 pub struct App {
     shutdown: Arc<AtomicBool>,
@@ -18,6 +31,9 @@ pub struct App {
     tray: Option<Tray>,
     visible: bool,
     confirm_defaults: bool,
+    display_slot: u8,
+    show_motion_settings: bool,
+    show_system_settings: bool,
 }
 
 impl App {
@@ -41,6 +57,9 @@ impl App {
             tray,
             visible,
             confirm_defaults: false,
+            display_slot: 0,
+            show_motion_settings: false,
+            show_system_settings: false,
         }
     }
 
@@ -124,7 +143,7 @@ impl App {
     fn system_settings(&mut self, ui: &mut egui::Ui) {
         let mut save = false;
         ui.group(|ui| {
-            ui.heading("System");
+            ui.heading("Server endpoint");
             ui.horizontal_wrapped(|ui| {
                 ui.label("UDP port (next launch):");
                 if ui
@@ -139,30 +158,6 @@ impl App {
                         Err(_) => self.note = "port must be a number from 0 to 65535.".into(),
                     }
                 }
-                save |= ui
-                    .checkbox(&mut self.cfg.expose_to_network, "Open to network")
-                    .changed();
-                save |= ui
-                    .checkbox(&mut self.cfg.start_minimized, "Start minimized to tray")
-                    .changed();
-                save |= ui
-                    .checkbox(&mut self.cfg.close_to_tray, "Hide to tray on close")
-                    .changed();
-                let mut enabled = autostart::is_enabled();
-                if ui.checkbox(&mut enabled, "Start with system").changed() {
-                    let result = if enabled {
-                        autostart::enable()
-                    } else {
-                        autostart::disable()
-                    };
-                    self.note = match result {
-                        Ok(()) => format!(
-                            "autostart {}.",
-                            if enabled { "enabled" } else { "disabled" }
-                        ),
-                        Err(e) => format!("autostart change failed: {e}"),
-                    };
-                }
             });
         });
         if save {
@@ -170,115 +165,410 @@ impl App {
         }
     }
 
-    fn status(&self, ui: &mut egui::Ui) {
-        let s = stats::snapshot();
-        let host = config::bind_host(self.cfg.expose_to_network);
-        ui.group(|ui| {
-            ui.heading("Status");
-            egui::Grid::new("status").num_columns(2).show(ui, |ui| {
-                ui.label("Listening on:");
-                ui.monospace(if s.server.bound_port == 0 {
-                    "binding…".into()
-                } else {
-                    format!("{host}:{}", s.server.bound_port)
+    fn app_preferences(&mut self, ui: &mut egui::Ui) {
+        let mut save = false;
+        ui.label(egui::RichText::new("APP").size(11.0).strong().color(AMBER));
+        save |= ui
+            .checkbox(&mut self.cfg.expose_to_network, "Open to network")
+            .changed();
+        save |= ui
+            .checkbox(&mut self.cfg.close_to_tray, "Close to tray")
+            .changed();
+        let mut enabled = autostart::is_enabled();
+        if ui.checkbox(&mut enabled, "Start with Windows").changed() {
+            let result = if enabled {
+                autostart::enable()
+            } else {
+                autostart::disable()
+            };
+            self.note = match result {
+                Ok(()) => format!(
+                    "start with Windows {}.",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                Err(e) => format!("start with Windows change failed: {e}"),
+            };
+        }
+        if save {
+            self.save("app preferences saved.");
+        }
+    }
+
+    fn panel_frame(active: bool) -> egui::Frame {
+        egui::Frame::NONE
+            .fill(SURFACE)
+            .stroke(Stroke::new(
+                if active { 1.5 } else { 1.0 },
+                if active { BORDER_STRONG } else { BORDER },
+            ))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::same(12))
+    }
+
+    fn dashboard_header(&mut self, ui: &mut egui::Ui, s: &stats::ServerStats) {
+        egui::Frame::NONE
+            .fill(SURFACE_DEEP)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(4)
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("SC2DSU")
+                                .size(22.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new("Steam Controller motion server")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Server & app").clicked() {
+                            self.show_system_settings = !self.show_system_settings;
+                        }
+                        let host = config::bind_host(self.cfg.expose_to_network);
+                        let endpoint = if s.server.bound_port == 0 {
+                            "Starting server…".into()
+                        } else {
+                            format!("{host}:{}", s.server.bound_port)
+                        };
+                        ui.label(
+                            egui::RichText::new(endpoint)
+                                .monospace()
+                                .size(12.0)
+                                .color(AMBER),
+                        );
+                        ui.separator();
+                        let throughput = ui.label(
+                            egui::RichText::new(format!(
+                                "{} controller{} · {} client{} · {:.0} Hz IMU · {:.0} pkt/s · {:.0} req/s",
+                                s.server.controllers,
+                                if s.server.controllers == 1 { "" } else { "s" },
+                                s.server.subscribers,
+                                if s.server.subscribers == 1 { "" } else { "s" },
+                                s.server.samples_per_sec,
+                                s.server.packets_per_sec,
+                                s.server.requests_per_sec,
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                        throughput.on_hover_text(format!(
+                            "Server ID 0x{:08X} · input {}",
+                            s.server.server_id,
+                            if s.server.device_active { "awake" } else { "idle" }
+                        ));
+                        ui.separator();
+                        ui.colored_label(
+                            if s.server.bound_port == 0 {
+                                AMBER
+                            } else {
+                                SUCCESS
+                            },
+                            if s.server.bound_port == 0 {
+                                "STARTING"
+                            } else {
+                                "DSU LIVE"
+                            },
+                        );
+                    });
                 });
-                ui.end_row();
-                ui.label("Server id:");
-                ui.monospace(format!("0x{:08X}", s.server.server_id));
-                ui.end_row();
-                ui.label("Controllers / subscribers:");
-                let device = if s.server.device_active {
-                    "awake"
-                } else {
-                    "idle"
-                };
+            });
+    }
+
+    fn slot_card(&mut self, ui: &mut egui::Ui, slot: u8, status: stats::SlotSection) {
+        let selected = self.display_slot == slot;
+        let response = Self::panel_frame(selected).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("SLOT {:02}", slot + 1))
+                            .size(11.0)
+                            .strong()
+                            .color(if selected { AMBER } else { DIM }),
+                    );
+                    ui.label(
+                        egui::RichText::new(if status.connected { "ON" } else { "--" })
+                            .size(20.0)
+                            .color(if status.connected { SUCCESS } else { DIM }),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    if let Some(controller) = status.controller {
+                        ui.label(
+                            egui::RichText::new(controller.name)
+                                .size(15.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {:.0} Hz",
+                                controller.transport, status.samples_per_sec
+                            ))
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No controller connected")
+                                .size(15.0)
+                                .color(MUTED),
+                        );
+                        ui.label(
+                            egui::RichText::new("Waiting for a Steam Controller")
+                                .size(12.0)
+                                .color(DIM),
+                        );
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(controller) = status.controller {
+                        let current = self.cfg.slot_for_controller(controller.id);
+                        let mut requested = current;
+                        let current_label = current
+                            .map(|slot| format!("DSU Slot {}", slot + 1))
+                            .unwrap_or_else(|| format!("Auto · Slot {}", slot + 1));
+                        egui::ComboBox::from_id_salt(("slot-routing", controller.id))
+                            .selected_text(current_label)
+                            .width(128.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut requested, None, "Automatic");
+                                for target in 0..stats::MAX_SLOTS as u8 {
+                                    ui.selectable_value(
+                                        &mut requested,
+                                        Some(target),
+                                        format!("DSU Slot {}", target + 1),
+                                    );
+                                }
+                            });
+                        if requested != current {
+                            match requested {
+                                Some(target) => {
+                                    self.cfg.assign_controller_to_slot(controller.id, target)
+                                }
+                                None => self.cfg.clear_controller_assignment(controller.id),
+                            }
+                            self.save("slot routing saved.");
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!("DSU Slot {}", slot + 1))
+                                .size(12.0)
+                                .color(DIM),
+                        );
+                    }
+                });
+            });
+        });
+        if response.response.clicked() {
+            self.display_slot = slot;
+        }
+    }
+
+    fn controllers_panel(&mut self, ui: &mut egui::Ui, s: &stats::ServerStats) {
+        Self::panel_frame(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Controllers & slots")
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Choose where each controller appears in your emulator.",
+                        )
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("4 DSU PORTS")
+                            .size(11.0)
+                            .strong()
+                            .color(AMBER),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            for (slot, status) in s.slots.iter().copied().enumerate() {
+                self.slot_card(ui, slot as u8, status);
+                if slot + 1 < stats::MAX_SLOTS {
+                    ui.add_space(6.0);
+                }
+            }
+        });
+    }
+
+    fn metric_card(ui: &mut egui::Ui, name: &str, value: f32) {
+        Self::panel_frame(false).show(ui, |ui| {
+            ui.label(egui::RichText::new(name).size(11.0).color(MUTED));
+            ui.label(
+                egui::RichText::new(format!("{value:+.1}°/s"))
+                    .size(20.0)
+                    .strong()
+                    .color(AMBER_BRIGHT),
+            );
+        });
+    }
+
+    fn motion_panel(&mut self, ui: &mut egui::Ui, s: &stats::ServerStats) {
+        let selected = s.slots[usize::from(self.display_slot)];
+        Self::panel_frame(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Live motion").size(18.0).strong());
+                    ui.label(
+                        egui::RichText::new("Choose the controller feeding this display.")
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let name = selected
+                        .controller
+                        .map(|controller| controller.name)
+                        .unwrap_or("No controller");
+                    egui::ComboBox::from_id_salt("motion-display-slot")
+                        .selected_text(format!("Viewing: Slot {} · {name}", self.display_slot + 1))
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for slot in 0..stats::MAX_SLOTS as u8 {
+                                let name = s.slots[usize::from(slot)]
+                                    .controller
+                                    .map(|controller| controller.name)
+                                    .unwrap_or("No controller");
+                                ui.selectable_value(
+                                    &mut self.display_slot,
+                                    slot,
+                                    format!("Slot {} · {name}", slot + 1),
+                                );
+                            }
+                        });
+                });
+            });
+            ui.add_space(12.0);
+            ui.columns(3, |columns| {
+                Self::metric_card(&mut columns[0], "PITCH", selected.motion.last_gyro_dps[0]);
+                Self::metric_card(&mut columns[1], "YAW", selected.motion.last_gyro_dps[1]);
+                Self::metric_card(&mut columns[2], "ROLL", selected.motion.last_gyro_dps[2]);
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
                 let calibration = if !s.calibration.active {
-                    "calibration off".into()
+                    "Calibration off".to_owned()
                 } else if s.calibration.steady {
                     format!(
-                        "calibration locked {:.0}%",
+                        "{:.0} Hz · Calibrated {:.0}%",
+                        selected.samples_per_sec,
                         s.calibration.confidence * 100.0
                     )
                 } else {
-                    "calibrating…".into()
+                    "Calibrating…".to_owned()
                 };
-                ui.monospace(format!(
-                    "{} / {} ({device}, {calibration})",
-                    s.server.controllers, s.server.subscribers
-                ));
-                ui.end_row();
-                ui.label("IMU / packets / requests:");
-                ui.monospace(format!(
-                    "{:.1} Hz / {:.1} s⁻¹ / {:.1} s⁻¹",
-                    s.server.samples_per_sec, s.server.packets_per_sec, s.server.requests_per_sec
-                ));
-                ui.end_row();
-                ui.label("Gyro (deg/s):");
-                ui.monospace(format!(
-                    "{:+8.1} {:+8.1} {:+8.1}",
-                    s.motion.last_gyro_dps[0], s.motion.last_gyro_dps[1], s.motion.last_gyro_dps[2]
-                ));
-                ui.end_row();
-                ui.label("Accel (g):");
-                ui.monospace(format!(
-                    "{:+6.3} {:+6.3} {:+6.3}",
-                    s.motion.last_accel_g[0], s.motion.last_accel_g[1], s.motion.last_accel_g[2]
-                ));
-                ui.end_row();
+                ui.colored_label(SUCCESS, calibration);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "accel {:+.2} {:+.2} {:+.2} g",
+                        selected.motion.last_accel_g[0],
+                        selected.motion.last_accel_g[1],
+                        selected.motion.last_accel_g[2]
+                    ))
+                    .monospace()
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [154.0, 30.0],
+                            egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "Recalibrate Slot {}",
+                                    self.display_slot + 1
+                                ))
+                                .color(Color32::WHITE),
+                            )
+                            .fill(ORANGE),
+                        )
+                        .clicked()
+                    {
+                        stats::RECENTER_SLOT_REQUEST
+                            .store(self.display_slot + 1, Ordering::Relaxed);
+                        stats::RECALIBRATE_SLOT_REQUEST
+                            .store(self.display_slot + 1, Ordering::Relaxed);
+                        self.note = format!("recalibrating slot {} gyro.", self.display_slot + 1);
+                    }
+                });
             });
         });
     }
 
-    fn visualization(&self, ui: &mut egui::Ui) {
-        let (response, painter) =
-            ui.allocate_painter(Vec2::new(ui.available_width(), 180.0), egui::Sense::hover());
-        let rect = response.rect;
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(32, 32, 32));
-        let q = stats::snapshot().motion.orientation;
-        let project = |v: [f32; 3]| {
-            let r = quat_rotate(q, v);
-            Pos2::new(rect.center().x + r[0] * 55.0, rect.center().y - r[1] * 55.0)
-        };
-        const V: [[f32; 3]; 8] = [
-            [-1.0, -0.4, -1.0],
-            [1.0, -0.4, -1.0],
-            [1.0, 0.4, -1.0],
-            [-1.0, 0.4, -1.0],
-            [-1.0, -0.4, 1.0],
-            [1.0, -0.4, 1.0],
-            [1.0, 0.4, 1.0],
-            [-1.0, 0.4, 1.0],
-        ];
-        const E: [(usize, usize); 12] = [
-            (0, 1),
-            (1, 2),
-            (2, 3),
-            (3, 0),
-            (4, 5),
-            (5, 6),
-            (6, 7),
-            (7, 4),
-            (0, 4),
-            (1, 5),
-            (2, 6),
-            (3, 7),
-        ];
-        for (a, b) in E {
-            painter.line_segment(
-                [project(V[a]), project(V[b])],
-                Stroke::new(2.0_f32, Color32::from_rgb(128, 224, 96)),
-            );
-        }
-        for (axis, color) in [
-            ([1.6, 0.0, 0.0], Color32::RED),
-            ([0.0, 1.6, 0.0], Color32::GREEN),
-            ([0.0, 0.0, 1.6], Color32::BLUE),
-        ] {
-            painter.line_segment(
-                [project([0.0; 3]), project(axis)],
-                Stroke::new(3.0_f32, color),
-            );
-        }
+    fn motion_settings_panel(&mut self, ui: &mut egui::Ui) {
+        Self::panel_frame(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Motion settings").size(16.0).strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Sensitivity, axis mapping and calibration · applies to all slots",
+                        )
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(if self.show_motion_settings {
+                            "Hide advanced"
+                        } else {
+                            "Advanced"
+                        })
+                        .clicked()
+                    {
+                        self.show_motion_settings = !self.show_motion_settings;
+                    }
+                });
+            });
+            if self.show_motion_settings {
+                ui.add_space(10.0);
+                self.settings(ui);
+            }
+        });
+    }
+
+    fn install_visuals(ctx: &egui::Context) {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = BG;
+        visuals.window_fill = SURFACE_DEEP;
+        visuals.extreme_bg_color = Color32::from_rgb(15, 15, 14);
+        visuals.faint_bg_color = SURFACE;
+        visuals.selection.bg_fill = Color32::from_rgb(120, 70, 31);
+        visuals.selection.stroke = Stroke::new(1.0, AMBER_BRIGHT);
+        visuals.widgets.noninteractive.bg_fill = SURFACE;
+        visuals.widgets.noninteractive.weak_bg_fill = SURFACE;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(44, 42, 37);
+        visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 42, 37);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(78, 58, 38);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(78, 58, 38);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, AMBER);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(3);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(173, 91, 34);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgb(173, 91, 34);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, AMBER_BRIGHT);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(3);
+        ctx.set_visuals(visuals);
     }
 
     fn handle_tray(&mut self, ctx: &egui::Context) {
@@ -304,6 +594,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_tray(ctx);
+        Self::install_visuals(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.cfg.close_to_tray && self.tray.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -312,44 +603,65 @@ impl eframe::App for App {
                 self.shutdown.store(true, Ordering::Relaxed);
             }
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.status(ui);
-            ui.add_space(6.0);
-            self.settings(ui);
-            ui.add_space(6.0);
-            self.system_settings(ui);
-            ui.add_space(6.0);
-            self.visualization(ui);
-            ui.horizontal(|ui| {
-                if ui.button("Hide to tray").clicked() {
-                    self.set_visible(ctx, false);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG)
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                let stats = stats::snapshot();
+                self.dashboard_header(ui, &stats);
+                ui.add_space(10.0);
+
+                if self.show_system_settings {
+                    self.system_settings(ui);
+                    ui.add_space(10.0);
                 }
-                if ui.button("Recalibrate").clicked() {
-                    stats::RECENTER_REQUEST.store(true, Ordering::Relaxed);
-                    stats::RECALIBRATE_REQUEST.store(true, Ordering::Relaxed);
-                    self.note = "recalibrating gyro.".into();
-                }
-                if ui
-                    .button(if self.confirm_defaults {
-                        "Confirm restore"
-                    } else {
-                        "Restore defaults"
-                    })
-                    .clicked()
-                {
-                    if self.confirm_defaults {
-                        self.cfg = config::Config::DEFAULT;
-                        self.port = self.cfg.port.to_string();
-                        self.save("restored defaults.");
+
+                ui.columns(2, |columns| {
+                    self.controllers_panel(&mut columns[0], &stats);
+                    self.motion_panel(&mut columns[1], &stats);
+                });
+
+                ui.add_space(10.0);
+                self.motion_settings_panel(ui);
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let host = config::bind_host(self.cfg.expose_to_network);
+                    ui.colored_label(SUCCESS, format!("Listening on {host}:{}", self.cfg.port));
+                    ui.separator();
+                    self.app_preferences(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Quit").clicked() {
+                            self.quit(ctx);
+                        }
+                        if ui
+                            .button(if self.confirm_defaults {
+                                "Confirm restore"
+                            } else {
+                                "Restore defaults"
+                            })
+                            .clicked()
+                        {
+                            if self.confirm_defaults {
+                                self.cfg = config::Config::DEFAULT;
+                                self.port = self.cfg.port.to_string();
+                                self.save("restored defaults.");
+                            }
+                            self.confirm_defaults = !self.confirm_defaults;
+                        }
+                        if ui.button("Hide to tray").clicked() {
+                            self.set_visible(ctx, false);
+                        }
+                    });
+                    if !self.note.is_empty() {
+                        ui.label(egui::RichText::new(&self.note).size(11.0).color(MUTED));
                     }
-                    self.confirm_defaults = !self.confirm_defaults;
-                }
-                if ui.button("Quit").clicked() {
-                    self.quit(ctx);
-                }
-                ui.label(&self.note);
+                });
             });
-        });
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
 }
@@ -530,7 +842,8 @@ pub fn run(
     let visible = !(cfg.start_minimized || start_minimized);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 850.0])
+            .with_inner_size([1040.0, 580.0])
+            .with_min_inner_size([850.0, 510.0])
             .with_visible(visible),
         ..Default::default()
     };
@@ -546,45 +859,4 @@ pub fn run(
         }),
     )
     .map_err(|e| e.to_string())
-}
-
-fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
-    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
-    let qx = [x, y, z];
-    let c1 = cross(qx, v);
-    let t = [c1[0] + w * v[0], c1[1] + w * v[1], c1[2] + w * v[2]];
-    let c2 = cross(qx, t);
-    [v[0] + 2.0 * c2[0], v[1] + 2.0 * c2[1], v[2] + 2.0 * c2[2]]
-}
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn approx_eq(a: [f32; 3], b: [f32; 3]) -> bool {
-        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
-    }
-    #[test]
-    fn quat_rotate_identity_is_noop() {
-        let v = [0.3, -1.2, 4.0];
-        assert!(approx_eq(quat_rotate([1.0, 0.0, 0.0, 0.0], v), v));
-    }
-    #[test]
-    fn quat_rotate_90deg_about_z_maps_x_to_y() {
-        let s = std::f32::consts::FRAC_1_SQRT_2;
-        assert!(approx_eq(
-            quat_rotate([s, 0.0, 0.0, s], [1.0, 0.0, 0.0]),
-            [0.0, 1.0, 0.0]
-        ));
-    }
-    #[test]
-    fn cross_of_basis_vectors() {
-        assert_eq!(cross([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
-    }
 }

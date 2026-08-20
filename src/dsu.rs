@@ -83,6 +83,7 @@ pub struct Server {
     last_cleanup: Instant,
     last_stats: Instant,
     samples_in_window: u32,
+    samples_per_slot_in_window: [u32; MAX_SLOTS],
     packets_in_window: u32,
     requests_in_window: u32,
     orientation_q: [[f32; 4]; MAX_SLOTS],
@@ -113,6 +114,7 @@ impl Server {
             last_cleanup: Instant::now(),
             last_stats: Instant::now(),
             samples_in_window: 0,
+            samples_per_slot_in_window: [0; MAX_SLOTS],
             packets_in_window: 0,
             requests_in_window: 0,
             orientation_q: [[1.0, 0.0, 0.0, 0.0]; MAX_SLOTS],
@@ -166,8 +168,26 @@ impl Server {
             self.orientation_q = [[1.0, 0.0, 0.0, 0.0]; MAX_SLOTS];
             self.last_sample_at = [None; MAX_SLOTS];
         }
+        let recenter_slot = stats::RECENTER_SLOT_REQUEST.swap(0, Ordering::Relaxed);
+        if recenter_slot != 0 {
+            let slot = usize::from(recenter_slot - 1);
+            if slot < MAX_SLOTS {
+                self.orientation_q[slot] = [1.0, 0.0, 0.0, 0.0];
+                self.last_sample_at[slot] = None;
+                let mut motion = stats::snapshot().slots[slot].motion;
+                motion.orientation = self.orientation_q[slot];
+                stats::publish_slot_motion(slot as u8, motion);
+            }
+        }
         loop {
             match self.sample_rx.try_recv() {
+                Ok(DeviceEvent::Connected { slot, controller }) => {
+                    let slot_index = usize::from(slot);
+                    if slot_index < MAX_SLOTS {
+                        self.connected[slot_index] = true;
+                        stats::publish_slot_connected(slot, controller);
+                    }
+                }
                 Ok(DeviceEvent::Sample { slot, state: s }) => {
                     let slot_index = usize::from(slot);
                     if slot_index >= MAX_SLOTS {
@@ -175,6 +195,7 @@ impl Server {
                     }
                     self.connected[slot_index] = true;
                     self.samples_in_window += 1;
+                    self.samples_per_slot_in_window[slot_index] += 1;
                     self.last_gyro = s.imu.gyro_dps;
                     self.broadcast_data_packet(slot, &s);
                     let now = Instant::now();
@@ -186,11 +207,13 @@ impl Server {
                     if dt > 0.0 {
                         integrate_gyro(&mut self.orientation_q[slot_index], s.imu.gyro_dps, dt);
                     }
-                    stats::publish_motion(stats::MotionSection {
+                    let motion = stats::MotionSection {
                         last_gyro_dps: s.imu.gyro_dps,
                         last_accel_g: s.imu.accel_g,
                         orientation: self.orientation_q[slot_index],
-                    });
+                    };
+                    stats::publish_motion(motion);
+                    stats::publish_slot_motion(slot, motion);
                 }
                 Ok(DeviceEvent::Disconnected { slot }) => {
                     let slot_index = usize::from(slot);
@@ -198,6 +221,7 @@ impl Server {
                         self.connected[slot_index] = false;
                         self.orientation_q[slot_index] = [1.0, 0.0, 0.0, 0.0];
                         self.last_sample_at[slot_index] = None;
+                        stats::publish_slot_disconnected(slot);
                     }
                 }
                 Err(TryRecvError::Empty) => return true,
@@ -240,6 +264,10 @@ impl Server {
             server_id: self.server_id,
             bound_port: self.socket.local_addr().map(|a| a.port()).unwrap_or(0),
         });
+        for (slot, samples) in self.samples_per_slot_in_window.iter_mut().enumerate() {
+            stats::publish_slot_rate(slot as u8, *samples as f32 / secs);
+            *samples = 0;
+        }
         self.requests_in_window = 0;
         self.samples_in_window = 0;
         self.packets_in_window = 0;

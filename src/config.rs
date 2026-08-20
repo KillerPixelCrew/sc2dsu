@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The DSU protocol exposes four controller ports.  Keep this independent of
+/// the HID module so config stays usable by the headless server and tests.
+pub const MAX_DSU_SLOTS: usize = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Axis {
     pub source: u8,
@@ -63,6 +67,11 @@ pub struct Config {
     pub gyro: AxisMap,
     pub accel: AxisMap,
     pub gyro_sensitivity: f32,
+    /// Optional, persistent controller-to-DSU-slot preferences.  Controller
+    /// IDs are stable hashes of HID identity data, not user-visible names.
+    /// Zero leaves a controller on the normal first-available-slot path.  TOML
+    /// has no representation for `None` inside a homogeneous array.
+    pub slot_assignments: [u64; MAX_DSU_SLOTS],
     pub start_minimized: bool,
     pub expose_to_network: bool,
     pub close_to_tray: bool,
@@ -75,6 +84,7 @@ impl Config {
         gyro: AxisMap::DEFAULT,
         accel: AxisMap::DEFAULT_ACCEL,
         gyro_sensitivity: GYRO_SENSITIVITY_DEFAULT,
+        slot_assignments: [0; MAX_DSU_SLOTS],
         start_minimized: false,
         expose_to_network: false,
         close_to_tray: false,
@@ -83,6 +93,36 @@ impl Config {
 
     pub fn effective_gyro_sensitivity(&self) -> f32 {
         clamp_sensitivity(self.gyro_sensitivity)
+    }
+
+    pub fn slot_for_controller(&self, controller_id: u64) -> Option<u8> {
+        self.slot_assignments
+            .iter()
+            .position(|assigned| *assigned == controller_id && controller_id != 0)
+            .map(|slot| slot as u8)
+    }
+
+    /// Pins a controller to a DSU slot.  A controller may only occupy one
+    /// preferred slot; moving it releases its old preference.  If another
+    /// controller was pinned to the destination, it becomes automatic.
+    pub fn assign_controller_to_slot(&mut self, controller_id: u64, slot: u8) {
+        if usize::from(slot) >= MAX_DSU_SLOTS {
+            return;
+        }
+        for assigned in &mut self.slot_assignments {
+            if *assigned == controller_id {
+                *assigned = 0;
+            }
+        }
+        self.slot_assignments[usize::from(slot)] = controller_id;
+    }
+
+    pub fn clear_controller_assignment(&mut self, controller_id: u64) {
+        for assigned in &mut self.slot_assignments {
+            if *assigned == controller_id {
+                *assigned = 0;
+            }
+        }
     }
 }
 
@@ -207,6 +247,7 @@ mod tests {
         assert!(!parsed.expose_to_network);
         assert!(parsed.auto_calibrate);
         assert_eq!(parsed.gyro_sensitivity, GYRO_SENSITIVITY_DEFAULT);
+        assert_eq!(parsed.slot_assignments, [0; MAX_DSU_SLOTS]);
     }
 
     #[test]
@@ -223,5 +264,18 @@ mod tests {
         assert_eq!(clamp_sensitivity(-1.0), GYRO_SENSITIVITY_MIN);
         assert_eq!(clamp_sensitivity(f32::NAN), GYRO_SENSITIVITY_DEFAULT);
         assert_eq!(clamp_sensitivity(f32::INFINITY), GYRO_SENSITIVITY_DEFAULT);
+    }
+
+    #[test]
+    fn controller_slot_assignment_moves_without_duplicates() {
+        let mut cfg = Config::default();
+        cfg.assign_controller_to_slot(10, 0);
+        cfg.assign_controller_to_slot(20, 1);
+        cfg.assign_controller_to_slot(10, 1);
+        assert_eq!(cfg.slot_assignments, [0, 10, 0, 0]);
+        assert_eq!(cfg.slot_for_controller(10), Some(1));
+        assert_eq!(cfg.slot_for_controller(20), None);
+        cfg.clear_controller_assignment(10);
+        assert_eq!(cfg.slot_for_controller(10), None);
     }
 }

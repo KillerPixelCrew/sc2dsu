@@ -1,6 +1,6 @@
 use crate::config;
 use crate::gyro_calibration::GyroCalibration;
-use crate::stats;
+use crate::stats::{self, ControllerInfo};
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 use std::time::{Duration, Instant};
 
@@ -137,10 +137,19 @@ pub struct ControllerState {
     pub imu: ImuSample,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum DeviceEvent {
-    Sample { slot: u8, state: ControllerState },
-    Disconnected { slot: u8 },
+    Connected {
+        slot: u8,
+        controller: ControllerInfo,
+    },
+    Sample {
+        slot: u8,
+        state: ControllerState,
+    },
+    Disconnected {
+        slot: u8,
+    },
 }
 
 pub fn pid_label(pid: u16) -> &'static str {
@@ -155,6 +164,48 @@ pub fn pid_label(pid: u16) -> &'static str {
         PID_NEREID_DONGLE => "Nereid dongle",
         _ => "?",
     }
+}
+
+fn controller_info(info: &DeviceInfo) -> ControllerInfo {
+    let product_id = info.product_id();
+    let transport = match product_id {
+        PID_STEAM_BLE | PID_STEAM_BLE2 | PID_TRITON_BLE => "Bluetooth",
+        PID_STEAM_DONGLE | PID_PROTEUS_DONGLE | PID_NEREID_DONGLE => "Wireless",
+        _ => "USB",
+    };
+    ControllerInfo {
+        id: stable_controller_id(info),
+        name: if is_steam_2015_pid(product_id) {
+            "Steam Controller (2015)"
+        } else {
+            "Steam Controller (2026)"
+        },
+        transport,
+    }
+}
+
+/// HID paths are stable for an attached interface, while serials (when a
+/// transport exposes one) survive reconnection.  Including the interface
+/// number distinguishes the four receiver ports of a Puck.
+fn stable_controller_id(info: &DeviceInfo) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut id = OFFSET;
+    let mut add = |bytes: &[u8]| {
+        for byte in bytes {
+            id ^= u64::from(*byte);
+            id = id.wrapping_mul(PRIME);
+        }
+    };
+    add(&info.vendor_id().to_le_bytes());
+    add(&info.product_id().to_le_bytes());
+    add(&info.interface_number().to_le_bytes());
+    if let Some(serial) = info.serial_number() {
+        add(serial.as_bytes());
+    } else {
+        add(info.path().to_bytes());
+    }
+    id
 }
 
 pub fn is_steam_2015_pid(pid: u16) -> bool {
@@ -751,6 +802,7 @@ pub struct OpenSlot {
     cfg_generation: u64,
     pub interface_number: i32,
     pub product_id: u16,
+    pub controller: ControllerInfo,
     pub input_reports_seen: u32,
 }
 
@@ -792,6 +844,7 @@ impl OpenSlot {
             cfg_generation,
             interface_number: info.interface_number(),
             product_id: info.product_id(),
+            controller: controller_info(info),
             input_reports_seen: 0,
         })
     }

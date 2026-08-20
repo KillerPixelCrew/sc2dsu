@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SC2DSU
+Comment=Steam Controller gyro to Cemuhook DSU server
+Exec=/usr/local/bin/sc2dsu
+Terminal=false
+Categories=Game;Utility;
+StartupNotify=true

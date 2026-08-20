@@ -1,0 +1,14 @@
+[Unit]
+Description=SC2DSU Steam Controller DSU server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust this path if the release binary is installed somewhere else.
+ExecStart=%h/.local/bin/sc2dsu --headless
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

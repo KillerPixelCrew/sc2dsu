@@ -8,7 +8,7 @@ Up to four connected controllers are exposed as DSU slots 0–3 in discovery ord
 
 If an axis is wrong, swap the source or flip invert in the settings window. Saved live; takes effect on the next IMU sample. Config lives at `%APPDATA%\sc2dsu\config.toml` on Windows or `$XDG_CONFIG_HOME/sc2dsu/config.toml` (normally `~/.config/sc2dsu/config.toml`) on Linux.
 
-The settings window, live status and motion visualization, tray controls, autostart, calibration controls, and start-minimized/close-to-tray behavior are available on both Windows and Linux.
+The settings window, live status, tray controls, autostart, calibration controls, and start-minimized/close-to-tray behavior are available on both Windows and Linux.
 
 ## Linux
 
@@ -35,7 +35,39 @@ sudo udevadm trigger
 
 Use `sc2dsu --probe` to verify HID access.
 
-Run modes: `sc2dsu` (GUI + server), `sc2dsu --tray` (start hidden), `sc2dsu --headless` (server only, log to stderr), `sc2dsu --probe` (enumerate Valve HIDs and dump 3 s of decoded IMU).
+Run modes: `sc2dsu` (GUI + server), `sc2dsu --tray` (start hidden), `sc2dsu --headless` (server only, logs to stderr), `sc2dsu --probe` (enumerate Valve HIDs and dump 3 s of decoded IMU).
+
+### GUI launcher without a terminal
+
+The provided desktop entry has `Terminal=false`, so launching SC2DSU from the
+application menu does not open a terminal window. After installing the binary
+at `/usr/local/bin/sc2dsu`, install the launcher with:
+
+```sh
+sudo install -Dm755 target/release/sc2dsu /usr/local/bin/sc2dsu
+sudo install -Dm644 packaging/linux/sc2dsu.desktop /usr/local/share/applications/sc2dsu.desktop
+```
+
+Running `sc2dsu` manually in a terminal intentionally keeps its diagnostic
+output attached to that terminal. Use `sc2dsu --headless` with the systemd
+service below when no GUI is wanted.
+
+### Headless systemd service
+
+For a machine that should serve DSU without a desktop session, use the provided
+user service. First install the release binary at `~/.local/bin/sc2dsu` (or
+edit `ExecStart` in the example), then install and start the service:
+
+```sh
+install -Dm644 packaging/systemd/sc2dsu.service ~/.config/systemd/user/sc2dsu.service
+systemctl --user daemon-reload
+systemctl --user enable --now sc2dsu
+```
+
+Check its output with `journalctl --user -u sc2dsu -f`. The service uses
+`--headless`, so it does not open an egui window. Ensure the account running
+the service has HID access via the udev rule above; a user service is preferred
+over running the DSU server as root.
 
 Tested hardware:
 

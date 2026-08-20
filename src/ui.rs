@@ -2,10 +2,12 @@ use crate::{autostart, config, stats};
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray::{Tray, TrayEvent};
 
 const AXIS_LABELS: [&str; 3] = ["raw X", "raw Y", "raw Z"];
+/// Solid-blue tray icon, 16x16.
+const TRAY_ICON_RGBA: [u8; 4] = [60, 130, 220, 255];
+const TRAY_ICON_SIZE: u32 = 16;
 
 pub struct App {
     shutdown: Arc<AtomicBool>,
@@ -13,9 +15,7 @@ pub struct App {
     cfg: config::Config,
     port: String,
     note: String,
-    tray: Option<TrayIcon>,
-    tray_show_id: Option<tray_icon::menu::MenuId>,
-    tray_quit_id: Option<tray_icon::menu::MenuId>,
+    tray: Option<Tray>,
     visible: bool,
     confirm_defaults: bool,
 }
@@ -29,10 +29,9 @@ impl App {
         let cfg = config::snapshot();
         let visible = !(cfg.start_minimized || start_minimized);
         ui_wants_device.store(visible, Ordering::Relaxed);
-        let (tray, tray_show_id, tray_quit_id) = make_tray().unwrap_or_else(|e| {
-            eprintln!("ui: system tray unavailable: {e}");
-            (None, None, None)
-        });
+        let tray = Tray::spawn()
+            .map_err(|e| eprintln!("ui: system tray unavailable: {e}"))
+            .ok();
         Self {
             shutdown,
             ui_wants_device,
@@ -40,8 +39,6 @@ impl App {
             cfg,
             note: String::new(),
             tray,
-            tray_show_id,
-            tray_quit_id,
             visible,
             confirm_defaults: false,
         }
@@ -269,7 +266,7 @@ impl App {
         for (a, b) in E {
             painter.line_segment(
                 [project(V[a]), project(V[b])],
-                Stroke::new(2.0, Color32::from_rgb(128, 224, 96)),
+                Stroke::new(2.0_f32, Color32::from_rgb(128, 224, 96)),
             );
         }
         for (axis, color) in [
@@ -277,29 +274,23 @@ impl App {
             ([0.0, 1.6, 0.0], Color32::GREEN),
             ([0.0, 0.0, 1.6], Color32::BLUE),
         ] {
-            painter.line_segment([project([0.0; 3]), project(axis)], Stroke::new(3.0, color));
+            painter.line_segment(
+                [project([0.0; 3]), project(axis)],
+                Stroke::new(3.0_f32, color),
+            );
         }
     }
 
     fn handle_tray(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                event,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                }
-            ) {
-                self.set_visible(ctx, !self.visible);
-            }
-        }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if Some(&event.id) == self.tray_show_id.as_ref() {
-                self.set_visible(ctx, true);
-            }
-            if Some(&event.id) == self.tray_quit_id.as_ref() {
-                self.quit(ctx);
+        let Some(tray) = &self.tray else {
+            return;
+        };
+        let events: Vec<TrayEvent> = std::iter::from_fn(|| tray.try_recv()).collect();
+        for event in events {
+            match event {
+                TrayEvent::Toggle => self.set_visible(ctx, !self.visible),
+                TrayEvent::Show => self.set_visible(ctx, true),
+                TrayEvent::Quit => self.quit(ctx),
             }
         }
     }
@@ -363,30 +354,171 @@ impl eframe::App for App {
     }
 }
 
-fn make_tray() -> Result<
-    (
-        Option<TrayIcon>,
-        Option<tray_icon::menu::MenuId>,
-        Option<tray_icon::menu::MenuId>,
-    ),
-    String,
-> {
-    let menu = Menu::new();
-    let show = MenuItem::new("Show settings", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    menu.append(&show).map_err(|e| e.to_string())?;
-    menu.append(&quit).map_err(|e| e.to_string())?;
-    let show_id = show.id().clone();
-    let quit_id = quit.id().clone();
-    let icon = Icon::from_rgba(vec![60, 130, 220, 255].repeat(16 * 16), 16, 16)
-        .map_err(|e| e.to_string())?;
-    let tray = TrayIconBuilder::new()
-        .with_tooltip("SC2DSU")
-        .with_icon(icon)
-        .with_menu(Box::new(menu))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok((Some(tray), Some(show_id), Some(quit_id)))
+/// System tray integration.
+///
+/// Both platforms expose the same [`Tray`] handle and [`TrayEvent`] stream. Linux speaks
+/// the StatusNotifierItem D-Bus protocol directly through `ksni`; using `tray-icon` there
+/// would link GTK3, libxdo and libayatana-appindicator into the binary and cost us a
+/// portable release build for no behavioural gain (libayatana-appindicator is itself just
+/// a StatusNotifierItem implementation).
+mod tray {
+    /// What the user asked for by clicking the tray icon or one of its menu entries.
+    pub enum TrayEvent {
+        /// Icon clicked: show the window if hidden, hide it if visible.
+        Toggle,
+        Show,
+        Quit,
+    }
+
+    #[cfg(target_os = "linux")]
+    mod imp {
+        use super::TrayEvent;
+        use std::sync::mpsc::{Receiver, Sender, channel};
+
+        struct SniTray {
+            tx: Sender<TrayEvent>,
+        }
+
+        impl ksni::Tray for SniTray {
+            fn id(&self) -> String {
+                "sc2dsu".into()
+            }
+
+            fn title(&self) -> String {
+                "SC2DSU".into()
+            }
+
+            fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+                let [r, g, b, a] = super::super::TRAY_ICON_RGBA;
+                let size = super::super::TRAY_ICON_SIZE as i32;
+                vec![ksni::Icon {
+                    width: size,
+                    height: size,
+                    // ARGB32, network byte order.
+                    data: [a, r, g, b].repeat((size * size) as usize),
+                }]
+            }
+
+            fn activate(&mut self, _x: i32, _y: i32) {
+                let _ = self.tx.send(TrayEvent::Toggle);
+            }
+
+            fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+                use ksni::menu::StandardItem;
+                vec![
+                    StandardItem {
+                        label: "Show settings".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            let _ = this.tx.send(TrayEvent::Show);
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "Quit".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            let _ = this.tx.send(TrayEvent::Quit);
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                ]
+            }
+        }
+
+        pub struct Tray {
+            rx: Receiver<TrayEvent>,
+            // Dropping the handle removes the icon, so it is held for the app's lifetime.
+            _handle: ksni::blocking::Handle<SniTray>,
+        }
+
+        impl Tray {
+            pub fn spawn() -> Result<Self, String> {
+                use ksni::blocking::TrayMethods;
+                let (tx, rx) = channel();
+                let handle = SniTray { tx }.spawn().map_err(|e| e.to_string())?;
+                Ok(Self {
+                    rx,
+                    _handle: handle,
+                })
+            }
+
+            pub fn try_recv(&self) -> Option<TrayEvent> {
+                self.rx.try_recv().ok()
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    mod imp {
+        use super::TrayEvent;
+        use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+        use tray_icon::{
+            Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+        };
+
+        pub struct Tray {
+            _icon: TrayIcon,
+            show_id: MenuId,
+            quit_id: MenuId,
+        }
+
+        impl Tray {
+            pub fn spawn() -> Result<Self, String> {
+                let menu = Menu::new();
+                let show = MenuItem::new("Show settings", true, None);
+                let quit = MenuItem::new("Quit", true, None);
+                menu.append(&show).map_err(|e| e.to_string())?;
+                menu.append(&quit).map_err(|e| e.to_string())?;
+                let show_id = show.id().clone();
+                let quit_id = quit.id().clone();
+                let size = super::super::TRAY_ICON_SIZE;
+                let icon = Icon::from_rgba(
+                    super::super::TRAY_ICON_RGBA.repeat((size * size) as usize),
+                    size,
+                    size,
+                )
+                .map_err(|e| e.to_string())?;
+                let icon = TrayIconBuilder::new()
+                    .with_tooltip("SC2DSU")
+                    .with_icon(icon)
+                    .with_menu(Box::new(menu))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                Ok(Self {
+                    _icon: icon,
+                    show_id,
+                    quit_id,
+                })
+            }
+
+            pub fn try_recv(&self) -> Option<TrayEvent> {
+                if let Ok(event) = TrayIconEvent::receiver().try_recv()
+                    && matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    )
+                {
+                    return Some(TrayEvent::Toggle);
+                }
+                if let Ok(event) = MenuEvent::receiver().try_recv() {
+                    if event.id == self.show_id {
+                        return Some(TrayEvent::Show);
+                    }
+                    if event.id == self.quit_id {
+                        return Some(TrayEvent::Quit);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    pub use imp::Tray;
 }
 
 pub fn run(

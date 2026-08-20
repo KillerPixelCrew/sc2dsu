@@ -198,7 +198,7 @@ impl App {
         egui::Frame::NONE
             .fill(SURFACE)
             .stroke(Stroke::new(
-                if active { 1.5 } else { 1.0 },
+                if active { 1.5_f32 } else { 1.0_f32 },
                 if active { BORDER_STRONG } else { BORDER },
             ))
             .corner_radius(4)
@@ -208,7 +208,7 @@ impl App {
     fn dashboard_header(&mut self, ui: &mut egui::Ui, s: &stats::ServerStats) {
         egui::Frame::NONE
             .fill(SURFACE_DEEP)
-            .stroke(Stroke::new(1.0, BORDER))
+            .stroke(Stroke::new(1.0_f32, BORDER))
             .corner_radius(4)
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
@@ -551,22 +551,22 @@ impl App {
         visuals.extreme_bg_color = Color32::from_rgb(15, 15, 14);
         visuals.faint_bg_color = SURFACE;
         visuals.selection.bg_fill = Color32::from_rgb(120, 70, 31);
-        visuals.selection.stroke = Stroke::new(1.0, AMBER_BRIGHT);
+        visuals.selection.stroke = Stroke::new(1.0_f32, AMBER_BRIGHT);
         visuals.widgets.noninteractive.bg_fill = SURFACE;
         visuals.widgets.noninteractive.weak_bg_fill = SURFACE;
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
         visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
         visuals.widgets.inactive.bg_fill = Color32::from_rgb(44, 42, 37);
         visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 42, 37);
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
         visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(78, 58, 38);
         visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(78, 58, 38);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, AMBER);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, AMBER);
         visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(3);
         visuals.widgets.active.bg_fill = Color32::from_rgb(173, 91, 34);
         visuals.widgets.active.weak_bg_fill = Color32::from_rgb(173, 91, 34);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0, AMBER_BRIGHT);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, AMBER_BRIGHT);
         visuals.widgets.active.corner_radius = egui::CornerRadius::same(3);
         ctx.set_visuals(visuals);
     }

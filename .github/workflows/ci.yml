@@ -10,8 +10,12 @@ permissions:
 
 jobs:
   check:
-    name: Lint, format, and build
-    runs-on: windows-latest
+    name: Lint, format, test, and build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     # Skip PRs from forks: run on pushes by maintainers and PRs from same-repo branches only.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
@@ -25,11 +29,44 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
 
+      # No system packages are needed on Linux: the tray speaks StatusNotifierItem over
+      # D-Bus through ksni, hidapi uses its pure-Rust hidraw backend, and winit/glutin
+      # dlopen X11, Wayland and GL at runtime rather than linking them.
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: cargo test
+        run: cargo test --locked
+
       - name: cargo build (release)
         run: cargo build --release --locked
+
+      # Catches a newly added crate quietly linking a C library that most users do not
+      # have installed. The glibc bound is enforced in the release build, which pins its
+      # runner; here the image floats, so only the library allowlist is checked.
+      - name: Check Linux binary portability
+        if: runner.os == 'Linux'
+        run: .github/scripts/check-linux-portability.sh target/release/sc2dsu any
+
+      # Publishes each PR's binaries as downloadable artifacts, so a change can be tested
+      # on real hardware without a tag or a local toolchain for the other platform.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/sc2dsu.exe "dist/sc2dsu-windows-x86_64.exe"
+          else
+            cp target/release/sc2dsu "dist/sc2dsu-linux-x86_64"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sc2dsu-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error

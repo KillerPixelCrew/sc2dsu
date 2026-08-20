@@ -10,15 +10,33 @@ keywords = ["steam-controller", "dsu", "cemuhook", "gyro", "hidapi"]
 categories = ["hardware-support", "games"]
 
 [dependencies]
-hidapi = "2.6"
 crc32fast = "1.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+eframe = "0.31"
+
+# Linux drives the tray over the StatusNotifierItem D-Bus protocol directly, and talks to
+# hidraw through hidapi's pure-Rust backend. Using tray-icon (GTK3, libxdo,
+# libayatana-appindicator) and hidapi's C backend (libudev) instead would take the binary
+# from 4 shared-library dependencies to ~70 -- the difference between a portable release
+# binary and one that only runs on the distribution that built it.
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = [
+    "linux-native-basic-udev",
+] }
+ksni = { version = "0.3", default-features = false, features = [
+    "blocking",
+    "async-io",
+] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = "2.6"
+tray-icon = "0.19"
+
+[target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-nwg = { package = "native-windows-gui", version = "1" }
-nwd = { package = "native-windows-derive", version = "1" }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [build-dependencies]
 embed-manifest = "1"
@@ -27,3 +45,4 @@ embed-manifest = "1"
 lto = true
 strip = true
 codegen-units = 1
+

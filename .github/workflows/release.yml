@@ -5,11 +5,28 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned, not ubuntu-latest: a binary can run on any glibc at or above the one
+          # it was built against, never below, so the release build uses the oldest
+          # supported image. 22.04 ships glibc 2.35, which covers Debian 12, Ubuntu 22.04+,
+          # SteamOS 3.x and everything newer.
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            binary: target/release/sc2dsu
+            max_glibc: "2.35"
+          - os: windows-latest
+            target: windows-x86_64
+            binary: target/release/sc2dsu.exe
+            max_glibc: ""
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,15 +48,55 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # A release binary that only runs on the distribution that built it is worse than
+      # no Linux release at all, so this is a hard gate rather than a warning.
+      - name: Check Linux binary portability
+        if: runner.os == 'Linux'
+        run: .github/scripts/check-linux-portability.sh "${{ matrix.binary }}" "${{ matrix.max_glibc }}"
+
       - name: Stage artifact
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp target/release/sc2dsu.exe "dist/sc2dsu-${GITHUB_REF_NAME}.exe"
+          name="sc2dsu-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            name="${name}.exe"
+          fi
+          cp "${{ matrix.binary }}" "dist/${name}"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sc2dsu-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum sc2dsu-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/sc2dsu-*.exe
+          files: |
+            dist/sc2dsu-*
+            dist/SHA256SUMS.txt
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -10,13 +10,19 @@ mod triton;
 mod ui;
 
 use hidapi::HidApi;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const SAMPLE_QUEUE_LEN: usize = 64;
+/// How often the scanner thread re-enumerates HID devices looking for new controllers.
+const SCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// First retry delay for an interface that refused to open, doubling up to the maximum.
+const OPEN_RETRY_MIN: Duration = Duration::from_secs(1);
+const OPEN_RETRY_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
@@ -93,13 +99,30 @@ fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::erro
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = sync_channel::<triton::DeviceEvent>(SAMPLE_QUEUE_LEN);
 
+    // Device discovery runs on its own thread. Enumerating the HID tree and opening
+    // interfaces are both blocking calls that can take hundreds of milliseconds on a
+    // busy system, so they must never share a thread with the controller read loop.
+    let owned_paths: OwnedPaths = Arc::new(Mutex::new(HashSet::new()));
+    let (dev_tx, dev_rx) = channel::<OpenedDevice>();
+
+    let scanner_handle = {
+        let dsu_wants = dsu_wants_device.clone();
+        let ui_wants = ui_wants_device.clone();
+        let shutdown = shutdown.clone();
+        let owned = owned_paths.clone();
+        thread::Builder::new()
+            .name("controller-scanner".into())
+            .spawn(move || run_scanner_thread(dsu_wants, ui_wants, shutdown, owned, dev_tx))?
+    };
+
     let device_handle = {
         let dsu_wants = dsu_wants_device.clone();
         let ui_wants = ui_wants_device.clone();
         let shutdown = shutdown.clone();
+        let owned = owned_paths.clone();
         thread::Builder::new()
             .name("controller-reader".into())
-            .spawn(move || run_device_thread(dsu_wants, ui_wants, shutdown, tx))?
+            .spawn(move || run_device_thread(dsu_wants, ui_wants, shutdown, tx, dev_rx, owned))?
     };
 
     let server_handle = {
@@ -131,14 +154,64 @@ fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::erro
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = device_handle.join();
+    let _ = scanner_handle.join();
     Ok(())
 }
 
-fn run_device_thread(
+/// A controller the scanner thread opened, on its way to the polling thread.
+struct OpenedDevice {
+    path: Vec<u8>,
+    device: triton::OpenSlot,
+}
+
+/// Device paths the polling thread currently holds, so the scanner will not reopen them.
+type OwnedPaths = Arc<Mutex<HashSet<Vec<u8>>>>;
+
+/// A lock on the owned-path set that survives a panic in the other thread; the set is
+/// plain data, so inheriting it after a poisoning is safe and better than dying too.
+fn lock_paths(owned: &OwnedPaths) -> MutexGuard<'_, HashSet<Vec<u8>>> {
+    owned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn release_path(owned: &OwnedPaths, path: &[u8]) {
+    lock_paths(owned).remove(path);
+}
+
+/// Sleeps in short steps so shutdown does not have to wait out a whole scan interval.
+fn sleep_until(shutdown: &AtomicBool, total: Duration) {
+    const STEP: Duration = Duration::from_millis(50);
+    let deadline = Instant::now() + total;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        thread::sleep(remaining.min(STEP));
+    }
+}
+
+/// An interface that would not open, and when it is worth trying again.
+struct OpenFailure {
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+/// Enumerates HID devices and opens new controllers, handing them to the polling thread.
+///
+/// `HidApi::refresh_devices` walks the whole HID tree and `OpenSlot::open` issues feature
+/// reports to hardware; both block for as long as the OS takes. Keeping them here means a
+/// slow enumeration delays only the next discovery, never a live controller's reads.
+fn run_scanner_thread(
     dsu_wants: Arc<AtomicBool>,
     ui_wants: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    tx: SyncSender<triton::DeviceEvent>,
+    owned: OwnedPaths,
+    dev_tx: Sender<OpenedDevice>,
 ) {
     let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
 
@@ -150,60 +223,124 @@ fn run_device_thread(
         }
     };
 
-    let mut controllers = Vec::<ManagedController>::new();
-    let mut next_scan = Instant::now();
+    // Multi-slot receivers such as the Proteus Puck expose one interface per slot and the
+    // unpaired ones fail to open every time. Retrying those once a second burns a blocking
+    // open apiece and floods the log, so each failing path backs off exponentially.
+    let mut retry: HashMap<Vec<u8>, OpenFailure> = HashMap::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         if !want_device() {
-            disconnect_all(&mut controllers, &tx);
-            thread::sleep(Duration::from_millis(200));
-            next_scan = Instant::now();
+            retry.clear();
+            sleep_until(&shutdown, Duration::from_millis(200));
             continue;
         }
 
-        if Instant::now() >= next_scan {
-            if let Err(e) = api.refresh_devices() {
-                eprintln!("controller: refresh_devices failed ({e}); rebuilding HidApi");
-                match HidApi::new() {
-                    Ok(a) => api = a,
-                    Err(e) => {
-                        eprintln!("controller: HidApi re-init failed: {e}; backing off");
-                        thread::sleep(Duration::from_millis(1000));
-                        continue;
-                    }
-                }
-            }
-            for info in triton::list_candidates(&api) {
-                let path = info.path().to_bytes().to_vec();
-                if controllers.iter().any(|controller| controller.path == path) {
+        if let Err(e) = api.refresh_devices() {
+            eprintln!("controller: refresh_devices failed ({e}); rebuilding HidApi");
+            match HidApi::new() {
+                Ok(a) => api = a,
+                Err(e) => {
+                    eprintln!("controller: HidApi re-init failed: {e}; backing off");
+                    sleep_until(&shutdown, Duration::from_secs(1));
                     continue;
                 }
-                match triton::OpenSlot::open(&api, &info) {
-                    Ok(device) => {
-                        eprintln!(
-                            "controller: opened iface {} (PID {:04X} {})",
-                            device.interface_number,
-                            device.product_id,
-                            triton::pid_label(device.product_id),
-                        );
-                        controllers.push(ManagedController {
-                            path,
-                            device,
-                            dsu_slot: None,
-                            last_sample_at: Instant::now(),
-                            consecutive_errors: 0,
-                            last_imu_timestamp: None,
-                            stale_samples: 0,
-                        });
+            }
+        }
+
+        let mut present = HashSet::new();
+        for info in triton::list_candidates(&api) {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            let path = info.path().to_bytes().to_vec();
+            present.insert(path.clone());
+
+            if lock_paths(&owned).contains(&path) {
+                continue;
+            }
+            if let Some(failure) = retry.get(&path)
+                && Instant::now() < failure.next_attempt
+            {
+                continue;
+            }
+
+            match triton::OpenSlot::open(&api, &info) {
+                Ok(device) => {
+                    retry.remove(&path);
+                    eprintln!(
+                        "controller: opened iface {} (PID {:04X} {})",
+                        device.interface_number,
+                        device.product_id,
+                        triton::pid_label(device.product_id),
+                    );
+                    lock_paths(&owned).insert(path.clone());
+                    if dev_tx.send(OpenedDevice { path, device }).is_err() {
+                        return; // Polling thread is gone; nothing left to scan for.
                     }
-                    Err(e) => eprintln!(
-                        "controller: open iface {} (PID {:04X}) failed: {e}",
+                }
+                Err(e) => {
+                    let failure = retry.entry(path).or_insert(OpenFailure {
+                        attempts: 0,
+                        next_attempt: Instant::now(),
+                    });
+                    failure.attempts += 1;
+                    let delay = OPEN_RETRY_MIN
+                        .saturating_mul(1u32 << failure.attempts.saturating_sub(1).min(6))
+                        .min(OPEN_RETRY_MAX);
+                    failure.next_attempt = Instant::now() + delay;
+                    eprintln!(
+                        "controller: open iface {} (PID {:04X}) failed: {e}; retrying in {}s",
                         info.interface_number(),
-                        info.product_id()
-                    ),
+                        info.product_id(),
+                        delay.as_secs()
+                    );
                 }
             }
-            next_scan = Instant::now() + Duration::from_secs(1);
+        }
+
+        // An interface that vanished from enumeration (unplugged, or re-paired to a slot)
+        // gets a clean slate rather than staying stuck at a long backoff.
+        retry.retain(|path, _| present.contains(path));
+
+        sleep_until(&shutdown, SCAN_INTERVAL);
+    }
+}
+
+/// Polls every open controller. Does no enumeration and no opening, so nothing here can
+/// block on the OS for longer than a single HID read.
+fn run_device_thread(
+    dsu_wants: Arc<AtomicBool>,
+    ui_wants: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    tx: SyncSender<triton::DeviceEvent>,
+    dev_rx: Receiver<OpenedDevice>,
+    owned: OwnedPaths,
+) {
+    let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
+
+    let mut controllers = Vec::<ManagedController>::new();
+
+    while !shutdown.load(Ordering::Relaxed) {
+        if !want_device() {
+            disconnect_all(&mut controllers, &tx, &owned);
+            // Anything the scanner opened just before the request went away.
+            while let Ok(pending) = dev_rx.try_recv() {
+                release_path(&owned, &pending.path);
+            }
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+
+        while let Ok(pending) = dev_rx.try_recv() {
+            controllers.push(ManagedController {
+                path: pending.path,
+                device: pending.device,
+                dsu_slot: None,
+                last_sample_at: Instant::now(),
+                consecutive_errors: 0,
+                last_imu_timestamp: None,
+                stale_samples: 0,
+            });
         }
 
         if stats::RECALIBRATE_REQUEST.swap(false, Ordering::Relaxed) {
@@ -212,11 +349,11 @@ fn run_device_thread(
             }
         }
 
-        poll_controllers(&mut controllers, &tx);
+        poll_controllers(&mut controllers, &tx, &owned);
         thread::sleep(Duration::from_millis(2));
     }
 
-    disconnect_all(&mut controllers, &tx);
+    disconnect_all(&mut controllers, &tx, &owned);
 }
 
 struct ManagedController {
@@ -232,6 +369,7 @@ struct ManagedController {
 fn poll_controllers(
     controllers: &mut Vec<ManagedController>,
     tx: &SyncSender<triton::DeviceEvent>,
+    owned: &OwnedPaths,
 ) {
     const SILENCE_REOPEN_MS: u128 = 2000;
     const STALE_THRESHOLD: u32 = 100;
@@ -310,6 +448,8 @@ fn poll_controllers(
 
         if remove {
             let controller = controllers.remove(index);
+            // Hand the path back so the scanner can reopen this interface.
+            release_path(owned, &controller.path);
             if let Some(slot) = controller.dsu_slot {
                 occupied[usize::from(slot)] = false;
                 let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
@@ -321,8 +461,13 @@ fn poll_controllers(
     }
 }
 
-fn disconnect_all(controllers: &mut Vec<ManagedController>, tx: &SyncSender<triton::DeviceEvent>) {
+fn disconnect_all(
+    controllers: &mut Vec<ManagedController>,
+    tx: &SyncSender<triton::DeviceEvent>,
+    owned: &OwnedPaths,
+) {
     for controller in controllers.drain(..) {
+        release_path(owned, &controller.path);
         if let Some(slot) = controller.dsu_slot {
             let _ = tx.send(triton::DeviceEvent::Disconnected { slot });
         }

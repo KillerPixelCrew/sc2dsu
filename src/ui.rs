@@ -877,6 +877,7 @@ mod tray {
             }
         }
 
+        #[cfg_attr(not(windows), allow(dead_code))]
         pub fn wake(&self) {
             #[cfg(windows)]
             if let Some(hwnd) = self.hwnd {

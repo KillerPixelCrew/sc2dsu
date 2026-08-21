@@ -597,7 +597,10 @@ impl eframe::App for App {
         self.handle_tray(ctx);
         Self::install_visuals(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.cfg.close_to_tray && self.tray.is_some() {
+            // `quit` closes through the same path as the title-bar X; only divert a close to
+            // the tray when nobody has asked to shut down.
+            let quitting = self.shutdown.load(Ordering::Relaxed);
+            if self.cfg.close_to_tray && self.tray.is_some() && !quitting {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.set_visible(ctx, false);
             } else {

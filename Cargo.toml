@@ -1,6 +1,6 @@
 [package]
 name = "sc2dsu"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Cemuhook DSU server for 2015 and 2026 Steam Controller motion and inputs."
 license = "MIT"
@@ -36,7 +36,11 @@ tray-icon = "0.19"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }
+raw-window-handle = "0.6"
 
 [build-dependencies]
 embed-manifest = "1"

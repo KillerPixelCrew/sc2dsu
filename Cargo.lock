@@ -3151,7 +3151,7 @@ dependencies = [
 
 [[package]]
 name = "sc2dsu"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crc32fast",
  "dirs 5.0.1",
@@ -3159,6 +3159,7 @@ dependencies = [
  "embed-manifest",
  "hidapi",
  "ksni",
+ "raw-window-handle",
  "serde",
  "toml",
  "tray-icon",

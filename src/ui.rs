@@ -41,11 +41,12 @@ impl App {
         shutdown: Arc<AtomicBool>,
         ui_wants_device: Arc<AtomicBool>,
         start_minimized: bool,
+        wake: tray::Wake,
     ) -> Self {
         let cfg = config::snapshot();
         let visible = !(cfg.start_minimized || start_minimized);
         ui_wants_device.store(visible, Ordering::Relaxed);
-        let tray = Tray::spawn()
+        let tray = Tray::spawn(wake)
             .map_err(|e| eprintln!("ui: system tray unavailable: {e}"))
             .ok();
         Self {
@@ -745,7 +746,7 @@ mod tray {
         }
 
         impl Tray {
-            pub fn spawn() -> Result<Self, String> {
+            pub fn spawn(_wake: super::Wake) -> Result<Self, String> {
                 use ksni::blocking::TrayMethods;
                 let (tx, rx) = channel();
                 let handle = SniTray { tx }.spawn().map_err(|e| e.to_string())?;
@@ -763,20 +764,28 @@ mod tray {
 
     #[cfg(not(target_os = "linux"))]
     mod imp {
-        use super::TrayEvent;
-        use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+        use super::{TrayEvent, Wake};
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use tray_icon::menu::{Menu, MenuEvent, MenuItem};
         use tray_icon::{
             Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
         };
 
         pub struct Tray {
             _icon: TrayIcon,
-            show_id: MenuId,
-            quit_id: MenuId,
+            rx: Receiver<TrayEvent>,
         }
 
         impl Tray {
-            pub fn spawn() -> Result<Self, String> {
+            /// Creates the tray icon on the calling thread, which must be the one running
+            /// the winit event loop: `tray-icon` delivers its events through that thread's
+            /// Win32 message pump.
+            ///
+            /// Events are forwarded through our own channel rather than polled from the
+            /// crate's global receivers, so each one can also `wake` the UI. Without that,
+            /// a window hidden to the tray never repaints (Windows drops redraw requests
+            /// for invisible windows), `update` never runs, and the menu appears dead.
+            pub fn spawn(wake: Wake) -> Result<Self, String> {
                 let menu = Menu::new();
                 let show = MenuItem::new("Show settings", true, None);
                 let quit = MenuItem::new("Quit", true, None);
@@ -784,6 +793,38 @@ mod tray {
                 menu.append(&quit).map_err(|e| e.to_string())?;
                 let show_id = show.id().clone();
                 let quit_id = quit.id().clone();
+                let (tx, rx) = channel();
+
+                let forward = {
+                    let tx: Sender<TrayEvent> = tx.clone();
+                    move |event: TrayEvent| {
+                        let _ = tx.send(event);
+                        wake.wake();
+                    }
+                };
+                {
+                    let forward = forward.clone();
+                    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                        if event.id == show_id {
+                            forward(TrayEvent::Show);
+                        } else if event.id == quit_id {
+                            forward(TrayEvent::Quit);
+                        }
+                    }));
+                }
+                TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        forward(TrayEvent::Toggle);
+                    }
+                }));
+
                 let size = super::super::TRAY_ICON_SIZE;
                 let icon = Icon::from_rgba(
                     super::super::TRAY_ICON_RGBA.repeat((size * size) as usize),
@@ -797,35 +838,54 @@ mod tray {
                     .with_menu(Box::new(menu))
                     .build()
                     .map_err(|e| e.to_string())?;
-                Ok(Self {
-                    _icon: icon,
-                    show_id,
-                    quit_id,
-                })
+                Ok(Self { _icon: icon, rx })
             }
 
             pub fn try_recv(&self) -> Option<TrayEvent> {
-                if let Ok(event) = TrayIconEvent::receiver().try_recv()
-                    && matches!(
-                        event,
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        }
-                    )
-                {
-                    return Some(TrayEvent::Toggle);
+                self.rx.try_recv().ok()
+            }
+        }
+    }
+
+    /// Forces the egui window to run a frame so queued tray events get handled.
+    ///
+    /// `egui::Context::request_repaint` is not enough: on Windows, winit implements it with
+    /// `RedrawWindow`, which the OS ignores for hidden windows, so an app hidden to the tray
+    /// would never see the event. Showing the window via Win32 makes the OS emit `WM_PAINT`,
+    /// eframe runs `update`, and `handle_tray` takes it from there.
+    #[derive(Clone)]
+    pub struct Wake {
+        #[cfg(windows)]
+        hwnd: Option<isize>,
+    }
+
+    impl Wake {
+        pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+            #[cfg(windows)]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+                    Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get()),
+                    _ => None,
+                };
+                Self { hwnd }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = cc;
+                Self {}
+            }
+        }
+
+        pub fn wake(&self) {
+            #[cfg(windows)]
+            if let Some(hwnd) = self.hwnd {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNA, ShowWindow};
+                // SAFETY: plain Win32 call on a window handle eframe owns for the app's
+                // whole lifetime; the tray is dropped together with the `App`.
+                unsafe {
+                    ShowWindow(hwnd as _, SW_SHOWNA);
                 }
-                if let Ok(event) = MenuEvent::receiver().try_recv() {
-                    if event.id == self.show_id {
-                        return Some(TrayEvent::Show);
-                    }
-                    if event.id == self.quit_id {
-                        return Some(TrayEvent::Quit);
-                    }
-                }
-                None
             }
         }
     }
@@ -850,11 +910,12 @@ pub fn run(
     eframe::run_native(
         "SC2DSU — Steam Controller gyro to Cemuhook",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             Ok(Box::new(App::new(
                 shutdown,
                 ui_wants_device,
                 start_minimized,
+                tray::Wake::new(cc),
             )))
         }),
     )

@@ -85,6 +85,15 @@ Emulators that support the Controller Nativly like RPCS3 need the Steam Overlay 
 SDL Native Programms also do not need this Tool to access Gyro. 
 **So. No. You dont need this for RPCS3**
 
+# Pairs well with Steam Input Lease
+[Steam Input Lease](https://github.com/KillerPixelCrew/steam-input-lease) makes Steam let go of your controllers while a game or emulator runs, and hands them back to Steam when it exits. No need to disable the Steam Overlay for that shortcut. Run SC2DSU for gyro in emulators that want DSU, and launch controller-native ones like RPCS3 through Steam Input Lease.
+
+Windows only. Grab the zip from its [Releases](https://github.com/KillerPixelCrew/steam-input-lease/releases), drop both files next to `steam.exe`, restart Steam, and set the launch options to:
+
+```text
+"C:\Program Files (x86)\Steam\steam-input-lease.exe" -- %command%
+```
+
 
 # Like it? Found it useful?
 

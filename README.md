@@ -2,7 +2,7 @@
 
 Cemuhook DSU server for the original 2015 and 2026 Steam Controllers. It forwards motion, buttons, sticks, pads, and triggers to emulators such as Cemu, Eden, Citra, and Ryujinx on `127.0.0.1:26760`.
 
-Download the Windows or Linux binary from [Releases](https://github.com/NightHammer1000/sc2dsu/releases) and run it, then point your emulator at `127.0.0.1:26760`.
+Download the Windows or Linux binary from [Releases](https://github.com/KillerPixelCrew/sc2dsu/releases) and run it, then point your emulator at `127.0.0.1:26760`.
 
 Up to four connected controllers are exposed as DSU slots 0–3 in discovery order. Per-slot and per-MAC DSU subscriptions are both supported, so local multiplayer clients only receive the controller slots they request.
 

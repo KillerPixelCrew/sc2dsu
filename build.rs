@@ -12,13 +12,13 @@ fn main() {
     }
 
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
-        use embed_manifest::manifest::{DpiAwareness, Setting};
-        // The GUI uses a fixed-pixel nwd layout; declare DPI-unaware + GDI scaling so
-        // Windows bitmap-stretches the whole window rather than leaving it tiny on hi-DPI.
+        use embed_manifest::manifest::DpiAwareness;
+        // egui scales itself from the monitor DPI that winit reports, so the process must be
+        // per-monitor DPI aware. Declaring it DPI-unaware with GDI scaling makes Windows
+        // bitmap-stretch the window, which the OpenGL surface does not follow: on a scaled
+        // display the UI renders into an unscaled corner and the rest stays black (#18).
         embed_manifest::embed_manifest(
-            embed_manifest::new_manifest("sc2dsu")
-                .dpi_awareness(DpiAwareness::Unaware)
-                .gdi_scaling(Setting::Enabled),
+            embed_manifest::new_manifest("sc2dsu").dpi_awareness(DpiAwareness::PerMonitorV2),
         )
         .expect("embed manifest");
     }

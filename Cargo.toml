@@ -1,6 +1,6 @@
 [package]
 name = "sc2dsu"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "Cemuhook DSU server for 2015 and 2026 Steam Controller motion and inputs."
 license = "MIT"
